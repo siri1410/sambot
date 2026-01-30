@@ -40,4 +40,4 @@ USER node
 # Default port (Railway sets PORT automatically)
 ENV PORT=3000
 
-CMD ["sh", "-c", "node dist/index.js gateway --port $PORT --bind lan --allow-unconfigured"]
+CMD ["sh", "-c", "node dist/index.js gateway run --port $PORT --bind lan --allow-unconfigured"]
