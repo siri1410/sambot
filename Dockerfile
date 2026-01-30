@@ -37,13 +37,8 @@ ENV NODE_ENV=production
 # This reduces the attack surface by preventing container escape via root privileges
 USER node
 
-# Copy and set entrypoint script
-COPY docker-entrypoint.sh /app/docker-entrypoint.sh
-USER root
-RUN chmod +x /app/docker-entrypoint.sh
-USER node
-
 # Default port (Railway sets PORT automatically)
 ENV PORT=3000
 
-ENTRYPOINT ["/app/docker-entrypoint.sh"]
+# Run gateway - using shell form to expand $PORT
+CMD node dist/index.js gateway run --port ${PORT} --bind lan --allow-unconfigured
