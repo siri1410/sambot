@@ -32,6 +32,11 @@ RUN pnpm ui:build
 
 ENV NODE_ENV=production
 
+# Create config directory and copy default config for the node user
+RUN mkdir -p /home/node/.clawdbot && chown -R node:node /home/node/.clawdbot
+COPY docker-config.json /home/node/.clawdbot/moltbot.json
+RUN chown node:node /home/node/.clawdbot/moltbot.json
+
 # Security hardening: Run as non-root user
 # The node:22-bookworm image includes a 'node' user (uid 1000)
 # This reduces the attack surface by preventing container escape via root privileges
