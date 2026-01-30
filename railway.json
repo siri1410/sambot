@@ -5,7 +5,7 @@
     "dockerfilePath": "Dockerfile"
   },
   "deploy": {
-    "startCommand": "node dist/index.js gateway --port $PORT --bind lan --allow-unconfigured",
+    "startCommand": "node dist/index.js gateway run --port $PORT --bind lan --allow-unconfigured",
     "healthcheckPath": "/health",
     "healthcheckTimeout": 300,
     "restartPolicyType": "ON_FAILURE",
