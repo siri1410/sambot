@@ -8,7 +8,7 @@ dockerfilePath = "Dockerfile"
 
 [deploy]
 # Start command (overrides Dockerfile CMD if needed)
-startCommand = "node dist/index.js"
+startCommand = "node dist/index.js gateway run --port $PORT --bind lan --allow-unconfigured"
 
 # Health check configuration
 healthcheckPath = "/health"
