@@ -4,7 +4,7 @@ node_modules
 docker-compose.extra.yml
 dist
 *.bun-build
-pnpm-lock.yaml
+# pnpm-lock.yaml - needed for deployment
 bun.lock
 bun.lockb
 coverage
