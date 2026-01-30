@@ -1,0 +1,261 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (e.g., v2026.1.29)"
+        required: true
+        type: string
+      skip_tests:
+        description: "Skip CI tests (use with caution)"
+        required: false
+        default: false
+        type: boolean
+
+# Ensure only one release runs at a time
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: "22.x"
+  PNPM_VERSION: "10.23.0"
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # Validate and run CI checks
+  validate:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      is_prerelease: ${{ steps.version.outputs.is_prerelease }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Checkout submodules (retry)
+        run: |
+          set -euo pipefail
+          git submodule sync --recursive
+          for attempt in 1 2 3 4 5; do
+            if git -c protocol.version=2 submodule update --init --force --depth=1 --recursive; then
+              exit 0
+            fi
+            echo "Submodule update failed (attempt $attempt/5). Retrying..."
+            sleep $((attempt * 10))
+          done
+          exit 1
+
+      - name: Extract version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="${GITHUB_REF#refs/tags/}"
+          fi
+
+          # Remove 'v' prefix if present for semver comparison
+          VERSION_NUM="${VERSION#v}"
+
+          # Check if prerelease (contains -beta, -alpha, -rc, etc.)
+          if [[ "$VERSION_NUM" =~ -(alpha|beta|rc) ]]; then
+            IS_PRERELEASE="true"
+          else
+            IS_PRERELEASE="false"
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "is_prerelease=$IS_PRERELEASE" >> "$GITHUB_OUTPUT"
+          echo "Releasing version: $VERSION (prerelease: $IS_PRERELEASE)"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          check-latest: true
+
+      - name: Setup pnpm (corepack retry)
+        run: |
+          set -euo pipefail
+          corepack enable
+          for attempt in 1 2 3; do
+            if corepack prepare pnpm@${{ env.PNPM_VERSION }} --activate; then
+              pnpm -v
+              exit 0
+            fi
+            echo "corepack prepare failed (attempt $attempt/3). Retrying..."
+            sleep $((attempt * 10))
+          done
+          exit 1
+
+      - name: Capture node path
+        run: echo "NODE_BIN=$(dirname "$(node -p "process.execPath")")" >> "$GITHUB_ENV"
+
+      - name: Install dependencies
+        env:
+          CI: true
+        run: |
+          export PATH="$NODE_BIN:$PATH"
+          pnpm install --frozen-lockfile --ignore-scripts=false --config.engine-strict=false --config.enable-pre-post-scripts=true
+
+      - name: Lint
+        if: ${{ github.event.inputs.skip_tests != 'true' }}
+        run: pnpm lint
+
+      - name: Build
+        run: pnpm build && pnpm ui:build
+
+      - name: Test
+        if: ${{ github.event.inputs.skip_tests != 'true' }}
+        run: pnpm canvas:a2ui:bundle && pnpm test
+
+  # Build and push Docker images
+  docker:
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+      contents: read
+    strategy:
+      matrix:
+        platform:
+          - linux/amd64
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}},value=${{ needs.validate.outputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.validate.outputs.version }}
+            type=raw,value=latest,enable=${{ needs.validate.outputs.is_prerelease == 'false' }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+          push: true
+
+  # Create GitHub Release
+  github-release:
+    needs: [validate, docker]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract changelog for this version
+        id: changelog
+        run: |
+          VERSION="${{ needs.validate.outputs.version }}"
+          VERSION_NUM="${VERSION#v}"
+
+          # Try to extract changelog section for this version
+          # Assumes CHANGELOG.md format: ## [version] or ## version
+          if [ -f "CHANGELOG.md" ]; then
+            # Extract section between this version and the next version header
+            CHANGELOG_CONTENT=$(awk -v ver="$VERSION_NUM" '
+              /^## / {
+                if (found) exit
+                if ($0 ~ ver) found=1
+                next
+              }
+              found { print }
+            ' CHANGELOG.md)
+
+            if [ -n "$CHANGELOG_CONTENT" ]; then
+              echo "Found changelog content for $VERSION_NUM"
+              # Save to file to preserve newlines
+              echo "$CHANGELOG_CONTENT" > /tmp/changelog_section.md
+            else
+              echo "No changelog section found for $VERSION_NUM"
+              echo "See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md) for full release notes." > /tmp/changelog_section.md
+            fi
+          else
+            echo "No CHANGELOG.md found"
+            echo "Release $VERSION" > /tmp/changelog_section.md
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.validate.outputs.version }}
+          name: ${{ needs.validate.outputs.version }}
+          body_path: /tmp/changelog_section.md
+          draft: false
+          prerelease: ${{ needs.validate.outputs.is_prerelease == 'true' }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Deploy to production after release
+  deploy-production:
+    needs: [validate, github-release]
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: ${{ steps.deploy.outputs.url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Railway CLI
+        run: npm install -g @railway/cli
+
+      - name: Deploy to Railway (Production)
+        id: deploy
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: |
+          # Deploy to production service
+          railway up --service production --environment production --detach
+
+          # Get deployment URL (if available)
+          DEPLOY_URL=$(railway status --json 2>/dev/null | jq -r '.deploymentUrl // empty' || echo "")
+          if [ -n "$DEPLOY_URL" ]; then
+            echo "url=$DEPLOY_URL" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Release Summary
+        run: |
+          echo "## Release Deployment Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version:** ${{ needs.validate.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Prerelease:** ${{ needs.validate.outputs.is_prerelease }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Docker Image:** \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.validate.outputs.version }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **GitHub Release:** https://github.com/${{ github.repository }}/releases/tag/${{ needs.validate.outputs.version }}" >> $GITHUB_STEP_SUMMARY
