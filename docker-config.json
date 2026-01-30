@@ -1,5 +1,6 @@
 {
   "gateway": {
-    "mode": "local"
+    "mode": "local",
+    "bind": "lan"
   }
 }
